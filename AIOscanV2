@@ -1,0 +1,222 @@
+#!/bin/bash
+
+# Function to display the title screen
+title_screen() {
+    clear
+    echo "=================================================================="
+    echo "  **    ***   ***          ***                           "
+    echo " *  *    *   *   *        *   *                          "
+    echo "*    *   *   *   *        *                              "
+    echo "*    *   *   *   *        *       ****    ****   * ***   "
+    echo "*    *   *   *   *         ***   *    *       *  **   *  "
+    echo "******   *   *   *            *  *        *****  *    *  "
+    echo "*    *   *   *   *            *  *       *    *  *    *  "
+    echo "*    *   *   *   *        *   *  *    *  *   **  *    *  "
+    echo "*    *  ***   ***          ***    ****    *** *  *    *  "
+    echo "                                                         "
+    echo "=================================================================="
+}
+
+# Function to detect the package manager and install utilities
+install_if_missing() {
+    if [ -x "$(command -v apt-get)" ]; then
+        PKG_MANAGER="apt-get"
+        UPDATE_CMD="sudo apt-get update"
+        INSTALL_CMD="sudo apt-get install -y"
+    elif [ -x "$(command -v yum)" ]; then
+        PKG_MANAGER="yum"
+        UPDATE_CMD="sudo yum update"
+        INSTALL_CMD="sudo yum install -y"
+    elif [ -x "$(command -v pacman)" ]; then
+        PKG_MANAGER="pacman"
+        UPDATE_CMD="sudo pacman -Sy"
+        INSTALL_CMD="sudo pacman -S --noconfirm"
+    else
+        echo "Unsupported package manager. Please install pv, ipcalc, and nmap manually."
+        exit 1
+    fi
+
+    for package in "$@"; do
+        if ! which $package &> /dev/null; then
+            echo "$package is not installed. Installing..."
+            $UPDATE_CMD
+            $INSTALL_CMD $package
+        else
+            echo "$package is already installed."
+        fi
+    done
+}
+
+# Function to perform initial network scan
+initial_network_scan() {
+    echo "Performing initial network scan..."
+    nmap -sn $network | pv -p -t -e -N "Initial Network Scan" > /dev/null
+    active_ips=$(nmap -sn $network | grep "Nmap scan report for" | awk '{print $5}')
+    total_devices=$(echo "$active_ips" | wc -l)
+    echo "$total_devices devices found."
+
+    if [ "$total_devices" -eq 0 ]; then
+        echo "No devices found on the network."
+        return
+    fi
+
+    echo "Devices found:"
+    device_counter=1
+    for ip in $active_ips; do
+        echo "$device_counter. $ip"
+        device_counter=$((device_counter + 1))
+    done
+
+    echo "Enter the numbers of the devices you want to scan, separated by spaces (e.g., 1 2 3):"
+    read -a selected_devices
+
+    selected_ips=()
+    for i in "${selected_devices[@]}"; do
+        selected_ips+=($(echo "$active_ips" | sed -n "${i}p"))
+    done
+
+    echo "Selected devices:"
+    for ip in "${selected_ips[@]}"; do
+        echo "$ip"
+    done
+}
+
+# Function to perform detailed and vulnerability scans
+detailed_and_vuln_scans() {
+    if [ -z "$selected_ips" ]; then
+        echo "No devices selected. Please run the initial network scan first and select devices to scan."
+        return
+    fi
+
+    device_counter=1
+    num_devices=${#selected_ips[@]}
+    start_time=$(date +%s)
+    
+    for ip in "${selected_ips[@]}"; do
+        echo "[$device_counter/$num_devices] Performing detailed scan on $ip..."
+        nmap -O -p- -T4 -A $ip -oN "${network_name}_scan_$ip.txt" | pv -p -t -e -N "Detailed Scan $ip" > /dev/null
+        
+        os_info=$(grep -i "os details:" "${network_name}_scan_$ip.txt" | head -n 1)
+        device_type=$(grep -i "device type:" "${network_name}_scan_$ip.txt" | head -n 1)
+        host_name=$(grep -i "Nmap scan report for" "${network_name}_scan_$ip.txt" | head -n 1 | awk '{print $5}')
+        
+        echo "[$device_counter/$num_devices] Device Info:"
+        echo "Host: $host_name"
+        echo "OS Info: $os_info"
+        echo "Device Type: $device_type"
+
+        echo "[$device_counter/$num_devices] Performing vulnerability scan on $ip..."
+        nmap --script vuln $ip -oN "${network_name}_vuln_scan_$ip.txt" | pv -p -t -e -N "Vuln Scan $ip" > /dev/null
+
+        echo "[$device_counter/$num_devices] Searching for login pages on $ip..."
+        nmap --script http-enum $ip -oN "${network_name}_login_scan_$ip.txt" | pv -p -t -e -N "Login Scan $ip" > /dev/null
+        
+        vuln_count=$(grep -c "VULNERABLE" "${network_name}_vuln_scan_$ip.txt")
+        if [ "$vuln_count" -eq 0 ]; then
+            echo "No vulnerabilities found on $ip."
+        else
+            echo "$vuln_count vulnerabilities found on $ip."
+        fi
+
+        end_time=$(date +%s)
+        elapsed_time=$((end_time - start_time))
+        avg_time_per_device=$((elapsed_time / device_counter))
+        remaining_time=$((avg_time_per_device * (num_devices - device_counter)))
+
+        echo "Estimated time remaining: $(date -ud "@$remaining_time" +%H:%M:%S)"
+
+        device_counter=$((device_counter + 1))
+    done
+
+    echo "Scanning completed. Results are saved in ${network_name}_scan_*.txt, ${network_name}_vuln_scan_*.txt, and ${network_name}_login_scan_*.txt files."
+}
+
+# Function to summarize vulnerability scan results
+summarize_vuln_results() {
+    summary_file="${network_name}_vuln_summary.txt"
+    echo "Vulnerability Summary Report" > $summary_file
+    echo "============================" >> $summary_file
+
+    for file in ${network_name}_vuln_scan_*.txt; do
+        ip=$(echo $file | cut -d'_' -f4 | cut -d'.' -f1-4)
+        vuln_count=$(grep -c "VULNERABLE" $file)
+        echo "IP Address: $ip" >> $summary_file
+        if [ "$vuln_count" -eq 0 ]; then
+            echo "No apparent vulnerabilities detected." >> $summary_file
+        else
+            echo "----------------------------" >> $summary_file
+            grep -B 1 "VULNERABLE" $file >> $summary_file
+            echo "" >> $summary_file
+        fi
+    done
+
+    echo "Summary report saved to $summary_file."
+}
+
+# Main menu function
+main_menu() {
+    while true; do
+        title_screen
+        echo "Please choose an option:"
+        echo "1. Perform initial network scan"
+        echo "2. Perform detailed and vulnerability scans on identified devices"
+        echo "3. Summarize vulnerability scan results"
+        echo "4. Perform all steps"
+        echo "5. Exit"
+        read -p "Enter your choice [1-5]: " choice
+
+        case $choice in
+            1)
+                initial_network_scan
+                ;;
+            2)
+                detailed_and_vuln_scans
+                ;;
+            3)
+                summarize_vuln_results
+                ;;
+            4)
+                initial_network_scan
+                detailed_and_vuln_scans
+                summarize_vuln_results
+                ;;
+            5)
+                echo "Exiting."
+                exit 0
+                ;;
+            *)
+                echo "Invalid choice. Please try again."
+                ;;
+        esac
+
+        # Pause before returning to the menu
+        read -p "Press Enter to return to the main menu..."
+    done
+}
+
+# Check and install pv, ipcalc, and nmap if missing
+install_if_missing pv ipcalc nmap
+
+# Get the primary network interface IP and subnet mask
+ip_info=$(ip -4 addr show scope global dynamic | grep -m 1 -oP 'inet \K[\d.]+/\d+')
+ip_address=$(echo $ip_info | cut -d'/' -f1)
+subnet_mask=$(echo $ip_info | cut -d'/' -f2)
+
+# Check if we successfully got the IP info
+if [ -z "$ip_info" ]; then
+    echo "No active network interface found."
+    exit 1
+fi
+
+# Calculate the network range using ipcalc
+network=$(ipcalc -n "$ip_address/$subnet_mask" | grep Network | awk '{print $2}')
+
+# Get the network name
+read -p "Enter the network name: " network_name
+
+# Print the network range
+echo "Your network range is: $network"
+
+# Display the main menu
+main_menu
+
